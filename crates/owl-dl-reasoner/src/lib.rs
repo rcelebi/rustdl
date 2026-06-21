@@ -58,8 +58,9 @@ pub use realize::{
     Realization, instances_of, instances_of_internal, instances_of_saturation_only,
     instances_of_saturation_only_internal, is_instance_of, is_instance_of_internal,
     is_instance_of_saturation_only, is_instance_of_saturation_only_internal,
-    materialize_object_property_assertions, realize, realize_internal, realize_saturation_only,
-    realize_saturation_only_internal,
+    materialize_object_property_assertions, realize, realize_internal,
+    realize_internal_with_timeout, realize_saturation_only, realize_saturation_only_internal,
+    realize_with_timeout,
 };
 
 /// Run the standalone `ABox` consequence-based saturator on `ontology` and return
@@ -1578,8 +1579,85 @@ impl ConsistencyCache {
         &self,
         deadline: Option<std::time::Instant>,
     ) -> owl_dl_tableau::hyper::HyperResult {
+        self.run(&self.clauses, deadline)
+    }
+
+    /// Instance check via the ABox-seeded wedge: decide whether
+    /// `KB ⊨ class_id(individual)`.
+    ///
+    /// Reduction: `KB ⊨ C(a)` iff `KB ∪ {a : ¬C}` is inconsistent. For an
+    /// atomic class `C` and the named individual `a` (whose nominal node is
+    /// `{a}`), `a : ¬C` is the ⊥-headed clause `{a}(X) ⊓ C(X) → ⊥` — it
+    /// clashes exactly when the KB forces `C` at `a`'s node. The same
+    /// NN-rule hyper engine as [`Self::decide`] then runs over the `ABox` seed:
+    /// it is sound and terminating on nominals + inverse roles + number
+    /// restrictions (HF2 double-blocking + HF3 `≥n`/`≠` + HF4 NN-rule), the
+    /// fragment on which the older subset-blocking tableau does not halt.
+    ///
+    /// Verdict: `Unsat` ⟹ `a` is provably an instance of `C`; `Sat` ⟹ not
+    /// an instance (sound under HF5 trust-Sat, the same trust level as
+    /// `classify`); `Stalled` ⟹ undetermined (caller falls back).
+    pub(crate) fn decide_instance(
+        &self,
+        class_id: owl_dl_core::ir::ClassId,
+        individual: owl_dl_core::ir::IndividualId,
+        deadline: Option<std::time::Instant>,
+    ) -> owl_dl_tableau::hyper::HyperResult {
+        use owl_dl_core::clause::{Atom, DlClause, X};
+        use owl_dl_core::ir::ClassId;
+        let nominal = ClassId::new(self.num_classes + individual.index());
+        let mut clauses = self.clauses.clone();
+        clauses.push(DlClause {
+            body: vec![Atom::Class(class_id, X), Atom::Class(nominal, X)],
+            head: vec![],
+        });
+        self.run(&clauses, deadline)
+    }
+
+    /// Class ids (in vocabulary index space, `< num_classes`) that occur in
+    /// some clause **head** — i.e. are positively *derivable*. A class that
+    /// appears in no head can only be a member of an individual if it was
+    /// asserted (and assertions are injected as `{a} ⊑ C` clauses, so their
+    /// `C` *does* occur in a head). Hence realization need only instance-check
+    /// candidate classes: a non-candidate is never newly entailed, so skipping
+    /// it is completeness-preserving and avoids the costly tableau probe on
+    /// primitive leaf classes (e.g. `A ⊑ B` with `A` never on a head).
+    pub(crate) fn candidate_classes(&self) -> std::collections::HashSet<u32> {
+        use owl_dl_core::clause::Atom;
+        let mut out = std::collections::HashSet::new();
+        let mut note = |c: owl_dl_core::ir::ClassId| {
+            if c.index() < self.num_classes {
+                out.insert(c.index());
+            }
+        };
+        // Only `Class(C, v)` heads matter: a named individual is in atomic
+        // `C` iff `C` is derived *at its own node*, which happens only via a
+        // `Class` head atom. `Exists`/`AtLeast`/`AtMost` heads place their
+        // qualifier class on a generated/constrained successor, not the named
+        // node, so a class occurring *only* as an existential/cardinality
+        // qualifier is never a named individual's type and needs no probe.
+        // (∀R.C is clausified to `… ∧ R(x,y) → Class(C,y)`, a `Class` head, so
+        // value-restriction-derived memberships on named fillers are kept.)
+        for clause in &self.clauses {
+            for atom in &clause.head {
+                if let Atom::Class(c, _) = *atom {
+                    note(c);
+                }
+            }
+        }
+        out
+    }
+
+    /// Configure and run the NN-rule hyper engine on `clauses` against the
+    /// shared `ABox` seed. Shared by [`Self::decide`] and
+    /// [`Self::decide_instance`] so both apply identical engine options.
+    fn run(
+        &self,
+        clauses: &[owl_dl_core::clause::DlClause],
+        deadline: Option<std::time::Instant>,
+    ) -> owl_dl_tableau::hyper::HyperResult {
         use owl_dl_tableau::hyper::HyperEngine;
-        let mut engine = HyperEngine::new_seeded(&self.clauses, &self.seed)
+        let mut engine = HyperEngine::new_seeded(clauses, &self.seed)
             .with_sub_roles(self.sub_roles.clone())
             .with_nominals(self.num_classes, self.num_individuals);
         if hyper_double_block_enabled() {
@@ -2831,6 +2909,32 @@ impl PreparedOntology {
         deadline: Option<std::time::Instant>,
     ) -> Option<owl_dl_tableau::hyper::HyperResult> {
         self.consistency.as_ref().map(|c| c.decide(deadline))
+    }
+
+    /// Instance check via the ABox-seeded NN-rule wedge (the terminating,
+    /// SROIQ-complete path). `None` when the wedge is disabled or the input
+    /// has no `ABox`; otherwise the three-valued
+    /// [`owl_dl_tableau::hyper::HyperResult`] for `KB ⊨ class_id(individual)`
+    /// (`Unsat` = instance, `Sat` = not, `Stalled` = undetermined). See
+    /// [`ConsistencyCache::decide_instance`].
+    pub(crate) fn instance_check_wedge(
+        &self,
+        class_id: owl_dl_core::ir::ClassId,
+        individual: owl_dl_core::ir::IndividualId,
+        deadline: Option<std::time::Instant>,
+    ) -> Option<owl_dl_tableau::hyper::HyperResult> {
+        self.consistency
+            .as_ref()
+            .map(|c| c.decide_instance(class_id, individual, deadline))
+    }
+
+    /// Realization candidate classes (clause-head class ids) from the
+    /// ABox-seeded wedge, or `None` when the wedge is unavailable. See
+    /// [`ConsistencyCache::candidate_classes`].
+    pub(crate) fn realize_candidate_classes(&self) -> Option<std::collections::HashSet<u32>> {
+        self.consistency
+            .as_ref()
+            .map(ConsistencyCache::candidate_classes)
     }
 
     /// Lazy accessor for the `ABox` consistency check verdict.

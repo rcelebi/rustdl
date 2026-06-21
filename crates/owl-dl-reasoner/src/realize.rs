@@ -74,7 +74,7 @@ pub fn is_instance_of_internal(
         .ok_or_else(|| ReasonError::UnknownClass(individual_iri.to_owned()))?;
     let closure = saturate(internal);
     let prepared = PreparedOntology::from_internal(internal.clone())?;
-    instance_check_with_closure(internal, &closure, &prepared, class_id, individual_id)
+    instance_check_with_closure(internal, &closure, &prepared, class_id, individual_id, None)
 }
 
 /// Saturation-only counterpart of [`is_instance_of`]. Reports
@@ -145,20 +145,65 @@ fn instance_check_with_closure(
     prepared: &PreparedOntology,
     class_id: ClassId,
     individual_id: IndividualId,
+    per_check_timeout: Option<std::time::Duration>,
 ) -> Result<bool, ReasonError> {
     for told in told_classes_of(internal, individual_id) {
         if closure.contains(told, class_id) {
             return Ok(true);
         }
     }
-    // KB ⊨ C(a) iff `{a} ⊓ ¬C` is unsatisfiable.
-    let sat = prepared.decide(move |pool| {
-        let cls = pool.atomic(class_id);
-        let not_cls = pool.not(cls);
-        let nom = pool.nominal(individual_id);
-        pool.and(vec![nom, not_cls])
-    })?;
-    Ok(!sat)
+
+    // KB ⊨ C(a) iff `KB ∪ {a : ¬C}` is inconsistent.
+    //
+    // Primary path: the ABox-seeded hypertableau wedge. It is a terminating
+    // and (corpus-verified) complete decision procedure on the
+    // nominal + inverse-role + number-restriction fragment (HF2 double
+    // blocking + HF3 `≥n`/`≠` + HF4 NN-rule) — precisely the SHOIQ/SROIQ
+    // case on which the subset-blocking tableau (`prepared.decide`) does not
+    // halt, because the `{a} ⊓ ¬C` root is a nominal and nominal nodes are
+    // unblockable. `Unsat` ⟹ entailed instance; `Sat` ⟹ not an instance
+    // (sound under HF5 trust-Sat, classify's trust level).
+    let deadline = per_check_timeout.map(|budget| std::time::Instant::now() + budget);
+    match prepared.instance_check_wedge(class_id, individual_id, deadline) {
+        Some(owl_dl_tableau::hyper::HyperResult::Unsat) => return Ok(true),
+        // `Sat` ⟹ not an instance (sound under HF5 trust-Sat). `Stalled`
+        // (engine cap / deadline elapsed without a verdict) ⟹ not *provably*
+        // an instance — a sound under-approximation (no false positives),
+        // matching `classify`'s per-pair-timeout semantics. Both decline.
+        Some(
+            owl_dl_tableau::hyper::HyperResult::Sat | owl_dl_tableau::hyper::HyperResult::Stalled,
+        ) => {
+            return Ok(false);
+        }
+        // Wedge unavailable (no ABox, or RUSTDL_WEDGE_CONSISTENCY=0): fall
+        // back to the subset-blocking tableau below.
+        None => {}
+    }
+
+    // Fallback (wedge disabled): `{a} ⊓ ¬C` via the subset-blocking tableau.
+    // Bounded by the per-check budget so it cannot hang on the hard fragment;
+    // unbounded only when no budget is set (the historical behaviour, and the
+    // only path that can loop on nominal-heavy inputs — hence the wedge).
+    if let Some(budget) = per_check_timeout {
+        let dl = std::time::Instant::now() + budget;
+        match prepared.decide_with_deadline(dl, move |pool| {
+            let cls = pool.atomic(class_id);
+            let not_cls = pool.not(cls);
+            let nom = pool.nominal(individual_id);
+            pool.and(vec![nom, not_cls])
+        })? {
+            Some(sat) => Ok(!sat),
+            None => Ok(false),
+        }
+    } else {
+        let sat = prepared.decide(move |pool| {
+            let cls = pool.atomic(class_id);
+            let not_cls = pool.not(cls);
+            let nom = pool.nominal(individual_id);
+            pool.and(vec![nom, not_cls])
+        })?;
+        Ok(!sat)
+    }
 }
 
 /// Saturation-only counterpart to [`instance_check_with_closure`].
@@ -284,7 +329,14 @@ pub fn instances_of_internal(
     for idx in 0..internal.vocabulary.num_individuals() {
         let individual_id =
             IndividualId::new(u32::try_from(idx).expect("individual count fits in u32"));
-        if instance_check_with_closure(internal, &closure, &prepared, class_id, individual_id)? {
+        if instance_check_with_closure(
+            internal,
+            &closure,
+            &prepared,
+            class_id,
+            individual_id,
+            None,
+        )? {
             out.push(internal.vocabulary.individual_iri(individual_id).to_owned());
         }
     }
@@ -388,6 +440,30 @@ impl Realization {
 pub fn realize<A: ForIRI>(ontology: &SetOntology<A>) -> Result<Realization, ReasonError> {
     let internal = convert_ontology(ontology)?;
     realize_internal(&internal)
+}
+
+/// Like [`realize`] but bounds each per-individual instance check by
+/// `per_check_timeout_ms`. A pair whose tableau probe does not finish in
+/// time is recorded as "not an instance" — a sound under-approximation
+/// (no spurious types), symmetric to `classify`'s `per_pair_timeout_ms`.
+/// `None` or `Some(0)` means unbounded (identical to [`realize`]).
+///
+/// This is the entry the Python `materialize_inferred_class_assertions`
+/// binding uses: the `{a} ⊓ ¬C` reduction can otherwise hang on
+/// nominal-heavy SHOIQ/SROIQ `ABoxes` (nominal nodes are unblockable).
+///
+/// # Errors
+///
+/// See [`ReasonError`].
+pub fn realize_with_timeout<A: ForIRI>(
+    ontology: &SetOntology<A>,
+    per_check_timeout_ms: Option<u64>,
+) -> Result<Realization, ReasonError> {
+    let internal = convert_ontology(ontology)?;
+    let per_check = per_check_timeout_ms
+        .filter(|&ms| ms > 0)
+        .map(std::time::Duration::from_millis);
+    realize_internal_with_timeout(&internal, per_check)
 }
 
 /// Saturation-only realization. Skips every tableau probe (both
@@ -500,6 +576,20 @@ pub fn realize_saturation_only_internal(
 ///
 /// See [`ReasonError`].
 pub fn realize_internal(internal: &InternalOntology) -> Result<Realization, ReasonError> {
+    realize_internal_with_timeout(internal, None)
+}
+
+/// Internal entry point for [`realize_with_timeout`]. `per_check`
+/// bounds each per-individual `{a} ⊓ ¬C` tableau probe; `None` is
+/// unbounded (the historical [`realize_internal`] behaviour).
+///
+/// # Errors
+///
+/// See [`ReasonError`].
+pub fn realize_internal_with_timeout(
+    internal: &InternalOntology,
+    per_check: Option<std::time::Duration>,
+) -> Result<Realization, ReasonError> {
     // Use the top-down classifier — the same default as the public
     // `classify` entry. The N² pair-sweep that this previously
     // called (`classify_internal`) DNFs on real ontologies and
@@ -541,6 +631,31 @@ pub fn realize_internal(internal: &InternalOntology) -> Result<Realization, Reas
     let closure = saturate(internal);
     let prepared = PreparedOntology::from_internal(internal.clone())?;
 
+    // Candidate restriction (completeness-preserving): only instance-check
+    // classes that are positively *derivable* (occur in some clause head).
+    // A class in no head can only be a member if asserted, and assertions
+    // become `{a} ⊑ C` clauses whose `C` is on a head — so it is still a
+    // candidate. Non-candidates (e.g. primitive leaf classes) can never be
+    // newly entailed, so dropping them is sound and complete, and it avoids
+    // the expensive tableau probe that would only ever return "not a member".
+    // When the wedge is unavailable, keep every satisfiable class.
+    let satisfiable: Vec<(usize, &str)> = match prepared.realize_candidate_classes() {
+        Some(candidates) => satisfiable
+            .into_iter()
+            .filter(|(i, _)| candidates.contains(&(u32::try_from(*i).unwrap_or(u32::MAX))))
+            .collect(),
+        None => satisfiable,
+    };
+    if std::env::var_os("RUSTDL_TRACE").is_some() {
+        eprintln!(
+            "realize: {} individuals × {} candidate classes (of {} satisfiable) = {} probes",
+            individual_iris.len(),
+            satisfiable.len(),
+            class_iris.len(),
+            individual_iris.len() * satisfiable.len()
+        );
+    }
+
     // Per-individual realization is independent across individuals
     // (each builds a fresh tableau context per class probe via
     // `prepared.decide`). Parallelise the outer loop with rayon; the
@@ -560,6 +675,7 @@ pub fn realize_internal(internal: &InternalOntology) -> Result<Realization, Reas
                     &prepared,
                     class_id,
                     individual_id,
+                    per_check,
                 )? {
                     types.push(class_iri);
                 }

@@ -32,6 +32,13 @@ use crate::classify::{classify_saturation_only_internal, classify_top_down_inter
 /// the maps together.
 type IndivResult = (Vec<String>, Vec<String>);
 
+/// Whether the pseudo-model realization shortcut is enabled. **Default ON**;
+/// set `RUSTDL_PSEUDO_MODEL=0` (or empty) to disable (e.g. for debugging or to
+/// A/B the speedup). Matches rustdl's other default-on env-gate convention.
+fn pseudo_model_enabled() -> bool {
+    std::env::var_os("RUSTDL_PSEUDO_MODEL").is_none_or(|v| v != "0" && !v.is_empty())
+}
+
 /// Decide whether `KB ⊨ class_iri(individual_iri)`. Returns `true`
 /// iff `individual_iri` is provably an instance of `class_iri` in
 /// every model of `ontology`.
@@ -74,7 +81,15 @@ pub fn is_instance_of_internal(
         .ok_or_else(|| ReasonError::UnknownClass(individual_iri.to_owned()))?;
     let closure = saturate(internal);
     let prepared = PreparedOntology::from_internal(internal.clone())?;
-    instance_check_with_closure(internal, &closure, &prepared, class_id, individual_id, None)
+    instance_check_with_closure(
+        internal,
+        &closure,
+        &prepared,
+        class_id,
+        individual_id,
+        None,
+        None,
+    )
 }
 
 /// Saturation-only counterpart of [`is_instance_of`]. Reports
@@ -146,11 +161,24 @@ fn instance_check_with_closure(
     class_id: ClassId,
     individual_id: IndividualId,
     per_check_timeout: Option<std::time::Duration>,
+    base_types: Option<&std::collections::HashSet<u32>>,
 ) -> Result<bool, ReasonError> {
     for told in told_classes_of(internal, individual_id) {
         if closure.contains(told, class_id) {
             return Ok(true);
         }
+    }
+
+    // Pseudo-model shortcut: `base_types` is this individual's type set in ONE
+    // witness model of the ABox (a clash-free completion). If `class_id` is
+    // absent there, that model places the individual outside the class, so
+    // `KB ⊭ class_id(a)` — not an instance, with no need for a full probe.
+    // Sound AND complete-preserving: a genuinely entailed type holds in EVERY
+    // model, hence is present here, so it is never skipped.
+    if let Some(bt) = base_types
+        && !bt.contains(&class_id.index())
+    {
+        return Ok(false);
     }
 
     // KB ⊨ C(a) iff `KB ∪ {a : ¬C}` is inconsistent.
@@ -335,6 +363,7 @@ pub fn instances_of_internal(
             &prepared,
             class_id,
             individual_id,
+            None,
             None,
         )? {
             out.push(internal.vocabulary.individual_iri(individual_id).to_owned());
@@ -655,6 +684,23 @@ pub fn realize_internal_with_timeout(
             individual_iris.len() * satisfiable.len()
         );
     }
+    // Measure the node-status-cache hit ceiling for this realization run
+    // (gated by RUSTDL_GC_MEASURE; no-op otherwise).
+    owl_dl_tableau::hyper::gc_measure_reset();
+
+    // Pseudo-model shortcut (DEFAULT ON; disable with RUSTDL_PSEUDO_MODEL=0):
+    // compute ONE witness model of the ABox; per individual its type set lets
+    // us refute most (individual, class) pairs without a full wedge probe —
+    // sound and completeness-preserving (a genuinely entailed type holds in
+    // every model, hence is present in this one and is never skipped).
+    // Validated == HermiT on closure-derived (MIE) and tableau-derived
+    // (disjunction / ∀-propagation / cardinality-merge) instances; ~630× faster
+    // complete realization on MIE.
+    let base_model = if pseudo_model_enabled() {
+        prepared.realize_base_model_types(None)
+    } else {
+        None
+    };
 
     // Per-individual realization is independent across individuals
     // (each builds a fresh tableau context per class probe via
@@ -666,6 +712,7 @@ pub fn realize_internal_with_timeout(
         .map(|(idx, _iri)| {
             let individual_id =
                 IndividualId::new(u32::try_from(idx).expect("individual count fits in u32"));
+            let base_types = base_model.as_ref().map(|m| &m[idx]);
             let mut types: Vec<&str> = Vec::new();
             for (class_idx, class_iri) in &satisfiable {
                 let class_id = ClassId::new(u32::try_from(*class_idx).expect("class fits in u32"));
@@ -676,6 +723,7 @@ pub fn realize_internal_with_timeout(
                     class_id,
                     individual_id,
                     per_check,
+                    base_types,
                 )? {
                     types.push(class_iri);
                 }
@@ -702,6 +750,22 @@ pub fn realize_internal_with_timeout(
     for (iri, (types_owned, leaves)) in individual_iris.iter().zip(per_individual) {
         entailed_types.insert(iri.clone(), types_owned);
         most_specific_types.insert(iri.clone(), leaves);
+    }
+
+    if let Some((total, distinct)) = owl_dl_tableau::hyper::gc_measure_report() {
+        let reuse = total.saturating_sub(distinct);
+        // Diagnostic percentage only; f64 precision loss on these counts is
+        // irrelevant for a printed measurement.
+        #[allow(clippy::cast_precision_loss)]
+        let pct = if total > 0 {
+            100.0 * reuse as f64 / total as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[gc-measure] saturated nodes: total={total} distinct={distinct} \
+             redundant={reuse} ({pct:.1}%% reusable by a node-status cache)"
+        );
     }
 
     Ok(Realization {

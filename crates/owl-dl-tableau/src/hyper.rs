@@ -343,6 +343,34 @@ pub enum HyperResult {
     Stalled,
 }
 
+/// Node-recurrence measurement (gated by `RUSTDL_GC_MEASURE`). Quantifies the
+/// cache-hit *ceiling* of a TGC-style node-status global cache: across every
+/// saturated completion the engine materializes, how many node label-sets are
+/// distinct vs total. `(total - distinct)` is the redundant re-derivation such
+/// a cache could (at best) eliminate. Pure instrumentation — never affects a
+/// verdict. Serializes via a global lock, so enable only for measurement runs.
+static GC_MEASURE: std::sync::Mutex<Option<(u64, std::collections::HashSet<u64>)>> =
+    std::sync::Mutex::new(None);
+
+/// Begin a measurement window (no-op unless `RUSTDL_GC_MEASURE` is set).
+pub fn gc_measure_reset() {
+    if std::env::var_os("RUSTDL_GC_MEASURE").is_some()
+        && let Ok(mut g) = GC_MEASURE.lock()
+    {
+        *g = Some((0, std::collections::HashSet::new()));
+    }
+}
+
+/// Report `(total_saturated_nodes, distinct_label_sets)` for the window, or
+/// `None` if measurement is disabled.
+#[must_use]
+pub fn gc_measure_report() -> Option<(u64, u64)> {
+    GC_MEASURE
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|(t, d)| (*t, d.len() as u64)))
+}
+
 /// Per-run search instrumentation, read after [`HyperEngine::decide`]
 /// to interpret a wall measurement: a `Sat` reached with
 /// `branches_taken == 0` was decided by pure Horn propagation and
@@ -1164,7 +1192,35 @@ impl<'c> HyperEngine<'c> {
                 return HyperResult::Unsat;
             }
         }
+        self.gc_measure_record();
         HyperResult::Sat
+    }
+
+    /// Record this saturated completion's per-node label-set hashes into the
+    /// global measurement window (gated; no-op when disabled). See [`GC_MEASURE`].
+    fn gc_measure_record(&self) {
+        let Ok(mut guard) = GC_MEASURE.lock() else {
+            return;
+        };
+        let Some((total, distinct)) = guard.as_mut() else {
+            return;
+        };
+        for idx in 0..self.nodes.len() {
+            let n = HNode(u32::try_from(idx).expect("fits u32"));
+            if self.resolve(n) != n {
+                continue; // merged-away node
+            }
+            let mut labels: Vec<u32> = self.nodes[idx].labels.iter().map(|c| c.index()).collect();
+            labels.sort_unstable();
+            // FNV-1a over the sorted label ids.
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for l in labels {
+                h ^= u64::from(l);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+            *total += 1;
+            distinct.insert(h);
+        }
     }
 
     /// Fire the clauses an event newly enables. Reuses [`fire_clause`]
@@ -1330,6 +1386,25 @@ impl<'c> HyperEngine<'c> {
         } else {
             None
         }
+    }
+
+    /// Atomic class ids (`< num_classes`, i.e. excluding nominal classes)
+    /// labelling the seeded individual `individual_index` in this completion.
+    /// Soundly callable only after a `Sat` decide on a `new_seeded*` engine:
+    /// the completion IS a witness model, so a class `D ∉` this set is a sound
+    /// **non-membership** witness for that individual (there is a model in which
+    /// it is not a `D`) — the pseudo-model realization shortcut. Merges are
+    /// resolved through the union-find so the canonical (post-merge) labels are
+    /// read.
+    #[must_use]
+    pub fn seeded_individual_labels(&self, individual_index: u32, num_classes: u32) -> Vec<u32> {
+        let rep = self.resolve(HNode(individual_index));
+        self.nodes[rep.index()]
+            .labels
+            .iter()
+            .map(|c| c.index())
+            .filter(|&c| c < num_classes)
+            .collect()
     }
 
     /// Capture a [`crate::snapshot::GraphSnapshot`] of the current
@@ -1578,6 +1653,38 @@ impl<'c> HyperEngine<'c> {
     /// `decide`, not by `merge`'s return.
     #[must_use]
     pub fn new_seeded(clauses: &'c [DlClause], seed: &AboxSeed) -> Self {
+        Self::new_seeded_impl(
+            clauses,
+            seed,
+            std::sync::Arc::new(build_clause_indexes(clauses, None)),
+            std::sync::Arc::new(build_disjoint_pairs(clauses)),
+        )
+    }
+
+    /// Like [`Self::new_seeded`] but reuses caller-supplied prebuilt
+    /// `ClauseIndexes` + disjoint-pair set (shared via `Arc`) instead of
+    /// rebuilding them per call — the seeded analogue of
+    /// [`Self::new_with_prebuilt`]. The indexes MUST correspond to `clauses`
+    /// (same slice, same role hierarchy passed to `build_clause_indexes`);
+    /// pair with [`Self::with_sub_roles_keep_index`] so the index is not
+    /// rebuilt again. Used by the realization wedge to amortize index
+    /// construction across the per-(individual,class) instance checks.
+    #[must_use]
+    pub fn new_seeded_with_prebuilt(
+        clauses: &'c [DlClause],
+        seed: &AboxSeed,
+        indexes: std::sync::Arc<ClauseIndexes>,
+        disjoint_pairs: std::sync::Arc<std::collections::HashSet<(u32, u32)>>,
+    ) -> Self {
+        Self::new_seeded_impl(clauses, seed, indexes, disjoint_pairs)
+    }
+
+    fn new_seeded_impl(
+        clauses: &'c [DlClause],
+        seed: &AboxSeed,
+        indexes: std::sync::Arc<ClauseIndexes>,
+        disjoint_pairs: std::sync::Arc<std::collections::HashSet<(u32, u32)>>,
+    ) -> Self {
         let n = seed.num_individuals as usize;
         if n == 0 {
             // Degenerate: no individuals. Fall back to a single root so
@@ -1602,12 +1709,12 @@ impl<'c> HyperEngine<'c> {
             .collect();
         let mut engine = Self {
             clauses,
-            disjoint_pairs: std::sync::Arc::new(build_disjoint_pairs(clauses)),
+            disjoint_pairs,
             nodes,
             stats: SearchStats::default(),
             init_depth: 0,
             deadline: None,
-            indexes: std::sync::Arc::new(build_clause_indexes(clauses, None)),
+            indexes,
             worklist: Vec::new(),
             representative,
             sub_roles: None,
